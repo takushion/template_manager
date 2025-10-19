@@ -1,12 +1,8 @@
 
-use std::fs::File; // ファイルを扱うためのモジュール
-use std::io::{self,BufRead, BufReader, Stdout};
+use std::fs::{File, OpenOptions}; // ファイル操作を強化
+use std::io::{self, BufReader, BufWriter, Stdout};
 use std::path::PathBuf;
-use clap::Parser;
-//use walkdir::WalkDir;
-use ignore::Walk;
-
-use rayon::prelude::*;
+use serde::{Deserialize, Serialize}; // serde をインポート
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -18,124 +14,87 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, List, ListItem,},
 };
 
-#[derive(Debug)] // デバッグ表示できるようにする
-struct Match {
-    filepath: PathBuf,
-    line_num: usize,
-    content: String,
+
+const JSON_FILE: &str = "templates.json";
+
+/// テンプレートのデータ構造
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Template {
+    title: String,
+    body: String,
 }
 
-#[derive(Parser,Debug)]
-#[command(version, about = "指定されたファイルからキーワードを検索します")]
-
-struct Cli {
-
-    /// 検索対象のファイルパス
-    #[arg(required = true)]
-    target_dir: PathBuf,
-
-    #[arg(short = 'i', long = "ignore-case")]
-    ignore_case: bool,
-}
-
-const KEYWORDS: [&str; 2] = ["TODO", "FIXME"];
-
+/// アプリケーションの状態を保持する構造体
 struct App {
-    matches: Vec<Match>,
+    templates: Vec<Template>,
 }
 
 impl App {
     /// 新しいAppインスタンスを作成
-    fn new(matches: Vec<Match>) -> App {
-        App { matches }
+    fn new(templates: Vec<Template>) -> App {
+        App { templates }
     }
 }
 
+
 fn main() -> Result<(), Box<dyn std::error::Error>>{
-    let cli = Cli::parse();
+    let templates = load_templates(JSON_FILE)?;
+    let mut app = App::new(templates);
 
-    let files_to_search: Vec<PathBuf> = Walk::new(&cli.target_dir)
-        .filter_map(|result| match result {
-            Ok(entry) => {
-                if let Some(file_type) = entry.file_type() {
-                    if file_type.is_file() {
-                        return Some(entry.path().to_path_buf());
-                    }
-                }
-                None
-            }
-            Err(e) => {
-                eprintln!("警告: ファイル探索中にエラーが発生しました: {}", e);
-                None
-            }
-        })
-        .collect();
-    
-
-    let all_matches: Vec<Match> = files_to_search
-        .par_iter()
-        .filter_map(|filepath| {
-            match find_matches(filepath, &KEYWORDS, cli.ignore_case) {
-                Ok(matches) => Some(matches), // 成功したら Some(Vec<Match>)
-                Err(e) => {
-                    eprintln!("警告: ファイル {} の処理中にエラー: {}", filepath.display(), e);
-                    None // 失敗したら None (無視)
-                }
-            }
-        })
-        .flatten().collect();
-
-    let app = App::new(all_matches);
-    
-    // --- 3. TUIのセットアップ ---
+    // --- 2. TUIのセットアップ ---
     let mut terminal = setup_terminal()?;
 
-    // --- 4. TUIアプリケーションの実行 ---
-    // 検索結果をTUIに渡す
-    run_app(&mut terminal, app)?;
+    // --- 3. TUIアプリケーションの実行 ---
+    // App の「可変」参照をTUIに渡す
+    run_app(&mut terminal, &mut app)?;
 
-    // --- 5. TUIの後片付け ---
+    // --- 4. TUIの後片付け ---
     restore_terminal(&mut terminal)?;
+
+    // --- 5. データの保存 ---
+    // アプリケーションの状態をJSONファイルに保存
+    save_templates(JSON_FILE, &app)?;
 
     Ok(())
 }
 
-fn find_matches(filepath: &PathBuf, keywords: &[&str], ignore_case: bool) -> Result<Vec<Match>, Box<dyn std::error::Error>> {
-
-
-    let file = File::open(filepath)?; // ?演算子でエラーを自動的に呼び出し元に返す
-    let reader = BufReader::new(file);
-
-    let mut results: Vec<Match> = Vec::new();
-
-    for (index, line) in reader.lines().enumerate() {
-        // .map_err() でエラーの種類を変換
-        let line_content = line.map_err(|e| format!("行の読み込みに失敗しました: {}", e))?;
-
-
-        for kw in keywords {
-            let found = if ignore_case {
-                // 検索キーワード(kw)も小文字に変換
-                line_content.to_lowercase().contains(&kw.to_lowercase())
-            } else {
-                line_content.contains(kw)
-            };
-
-            if found {
-                let m = Match {
-                    filepath: filepath.clone(),
-                    line_num: index + 1,
-                    content: line_content.trim().to_string(),
-                };
-                results.push(m);
-                break; 
-            }
+// (ここからJSON I/O関数を新設)
+/// JSONファイルからテンプレートをロードする
+fn load_templates(filepath: &str) -> Result<Vec<Template>, Box<dyn std::error::Error>> {
+    // ファイルが存在しない場合は、空のリストを返す (初回起動時など)
+    let file = match File::open(filepath) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(Vec::new()); // 空のVecを返す
         }
-    }
+        Err(e) => {
+            return Err(Box::new(e)); // その他のエラーは返す
+        }
+    };
 
-    Ok(results)
+    let reader = BufReader::new(file);
+    // JSONをパースして Vec<Template> に変換
+    let templates = serde_json::from_reader(reader)?;
 
+    Ok(templates)
 }
+
+/// テンプレートをJSONファイルに保存する
+fn save_templates(filepath: &str, app: &App) -> Result<(), Box<dyn std::error::Error>> {
+    // ファイルを書き込みモード (または新規作成) で開く
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true) // 既存の内容を上書き
+        .open(filepath)?;
+
+    let writer = BufWriter::new(file);
+    // AppのテンプレートリストをJSONにシリアライズして書き込む
+    serde_json::to_writer_pretty(writer, &app.templates)?;
+
+    Ok(())
+}
+
 
 // (ここからTUI関連の関数をすべて追加)
 
@@ -166,32 +125,24 @@ fn restore_terminal(
 /// TUIアプリケーションのメインループ
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: App, // 検索結果を受け取る (今回はまだ使わない)
+    app: &mut App, // (変更) 可変参照 (&mut App) を受け取る
 ) -> Result<(), Box<dyn std::error::Error>> {
-    
-    // `loop` でTUIのメインループを開始
     loop {
         // --- 1. UIの描画 ---
-        // `terminal.draw()` の中(クロージャ)に描画処理を書く
         terminal.draw(|frame| {
-            // (frame: &mut Frame)
-            ui(frame, &app);
+            ui(frame, app); // (変更) Appの参照をui関数に渡す
         })?;
 
         // --- 2. イベントの処理 (キー入力) ---
-        // 100ミリ秒待機してキー入力があるかチェック
         if event::poll(std::time::Duration::from_millis(100))? {
-            // キー入力があった場合
             if let Event::Key(key) = event::read()? {
                 if key.code == KeyCode::Char('q') {
-                    // 'q' キーが押されたらループを抜けてプログラム終了
                     return Ok(());
                 }
             }
         }
     }
 }
-
 /// UIを描画する
 /// (この関数がTUIの「見た目」を定義する)
 fn ui(frame: &mut Frame, app: &App) {
@@ -206,34 +157,33 @@ fn ui(frame: &mut Frame, app: &App) {
 
     let title_text = format!(
         "アノテーション検索TUI | {} 件ヒット | 'q' で終了",
-        app.matches.len() // Appから件数を取得
+        app.templates.len() // Appから件数を取得
+    );
+    
+    // 2-1. タイトル
+    let title_text = format!(
+        "テンプレートマネージャ | {} 件登録 | 'q' で終了",
+        app.templates.len() // (変更) app.templates から件数を取得
     );
     let title = Paragraph::new(title_text)
-        .style(Style::default().fg(Color::White).bg(Color::Blue)); // スタイル(白文字/青背景)
+        .style(Style::default().fg(Color::White).bg(Color::Blue));
 
-    // 2-2. 検索結果リスト
-    // Vec<Match> を Vec<ListItem> に変換
+    // 2-2. テンプレートのタイトルリスト
+    // (変更) Vec<Template> から Vec<ListItem> に変換
     let items: Vec<ListItem> = app
-        .matches
+        .templates
         .iter()
-        .map(|m| {
-            // 1行のテキストを作成
-            let line_text = format!(
-                "{}:{}: {}",
-                m.filepath.display(),
-                m.line_num,
-                m.content
-            );
-            // ListItem に変換
-            ListItem::new(Line::from(line_text))
+        .map(|t| {
+            // (変更) テンプレートの「タイトル」を表示
+            ListItem::new(Line::from(t.title.clone()))
         })
         .collect();
 
-    // 検索結果のリストウィジェットを作成
-    let matches_list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("検索結果"));
+    // テンプレートのリストウィジェットを作成
+    let templates_list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("テンプレート一覧"));
 
     // --- 3. ウィジェットの描画 ---
-    frame.render_widget(title, main_layout[0]); // 1行目にタイトルを描画
-    frame.render_widget(matches_list, main_layout[1]); // 残りの領域にリストを描画
+    frame.render_widget(title, main_layout[0]);
+    frame.render_widget(templates_list, main_layout[1]); // (変更) matches_list から名前変更
 }
