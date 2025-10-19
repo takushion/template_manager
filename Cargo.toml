@@ -10,3 +10,6 @@ clap = { version = "4.5", features = ["derive"] }
 
 ignore = "0.4"
 rayon = "1.10"
+
+ratatui = { version = "0.27", features = ["crossterm"] }
+crossterm = "0.27"
