@@ -11,7 +11,7 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph, List, ListItem,},
+    widgets::{Block, Borders, Paragraph, List, ListItem, ListState},
 };
 
 
@@ -27,12 +27,53 @@ struct Template {
 /// アプリケーションの状態を保持する構造体
 struct App {
     templates: Vec<Template>,
+    state: ListState,
 }
 
 impl App {
     /// 新しいAppインスタンスを作成
     fn new(templates: Vec<Template>) -> App {
-        App { templates }
+        let mut state = ListState::default();
+        if !templates.is_empty() {
+            state.select(Some(0)); // 最初の項目 (インデックス0) を選択状態にする
+        }
+        App { templates, state } // state を初期化
+    }
+
+
+    pub fn next(&mut self) {
+        if self.templates.is_empty() {
+            return;
+        }
+        let i = match self.state.selected() {
+            Some(i) => {
+                if i >= self.templates.len() - 1 {
+                    0 // リストの最後に達したら最初に戻る (ラップアラウンド)
+                } else {
+                    i + 1
+                }
+            }
+            None => 0, // 何も選択されていなければ0を選択
+        };
+        self.state.select(Some(i));
+    }
+
+    /// リストで前の項目を選択
+    pub fn previous(&mut self) {
+        if self.templates.is_empty() {
+            return;
+        }
+        let i = match self.state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.templates.len() - 1 // リストの最初に達したら最後に戻る (ラップアラウンド)
+                } else {
+                    i - 1
+                }
+            }
+            None => 0, // 何も選択されていなければ0を選択
+        };
+        self.state.select(Some(i));
     }
 }
 
@@ -136,8 +177,21 @@ fn run_app(
         // --- 2. イベントの処理 (キー入力) ---
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') {
-                    return Ok(());
+                // (変更) キー入力処理
+                match key.code {
+                    KeyCode::Char('q') => {
+                        // 'q' キーが押されたら終了
+                        return Ok(());
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        // 'j' または 下矢印で次へ
+                        app.next();
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        // 'k' または 上矢印で前へ
+                        app.previous();
+                    }
+                    _ => {} // 他のキーは無視
                 }
             }
         }
@@ -145,7 +199,7 @@ fn run_app(
 }
 /// UIを描画する
 /// (この関数がTUIの「見た目」を定義する)
-fn ui(frame: &mut Frame, app: &App) {
+fn ui(frame: &mut Frame, app: &mut App) {
     // 画面全体をレイアウト
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -155,35 +209,66 @@ fn ui(frame: &mut Frame, app: &App) {
         ])
         .split(frame.size());
 
+    let content_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(40), // 左ペイン (タイトルリスト)
+            Constraint::Percentage(60), // 右ペイン (本文表示)
+        ])
+        .split(main_layout[1]); // main_layout[1] を分割
+    // (ここまで変更)
+
+    // --- 2. ウィジェットの作成 ---
+
+    // 2-1. タイトルバー
     let title_text = format!(
-        "アノテーション検索TUI | {} 件ヒット | 'q' で終了",
-        app.templates.len() // Appから件数を取得
-    );
-    
-    // 2-1. タイトル
-    let title_text = format!(
-        "テンプレートマネージャ | {} 件登録 | 'q' で終了",
-        app.templates.len() // (変更) app.templates から件数を取得
+        "テンプレートマネージャ | {} 件登録 | 'j/k'で移動, 'q'で終了",
+        app.templates.len()
     );
     let title = Paragraph::new(title_text)
         .style(Style::default().fg(Color::White).bg(Color::Blue));
 
-    // 2-2. テンプレートのタイトルリスト
-    // (変更) Vec<Template> から Vec<ListItem> に変換
+    // 2-2. テンプレートのタイトルリスト (左ペイン)
     let items: Vec<ListItem> = app
         .templates
         .iter()
-        .map(|t| {
-            // (変更) テンプレートの「タイトル」を表示
-            ListItem::new(Line::from(t.title.clone()))
-        })
+        .map(|t| ListItem::new(Line::from(t.title.clone())))
         .collect();
 
-    // テンプレートのリストウィジェットを作成
     let templates_list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("テンプレート一覧"));
+        .block(Block::default().borders(Borders::ALL).title("テンプレート一覧"))
+        .highlight_style( // (追加) 選択ハイライトのスタイル
+            Style::default()
+                .bg(Color::LightGreen) // 背景色
+                .fg(Color::Black)      // 文字色
+                .add_modifier(Modifier::BOLD), // 太字
+        );
+
+    // (ここから追加)
+    // 2-3. 選択中のテンプレート本文 (右ペイン)
+    // 現在選択中のインデックスを取得
+    let selected_body = match app.state.selected() {
+        Some(index) => {
+            // インデックスが範囲内なら、そのテンプレートの本文
+            app.templates.get(index).map_or(
+                "（テンプレートが選択されていません）",
+                |t| t.body.as_str(), // .as_str() で &str を取得
+            )
+        }
+        None => "（テンプレートが選択されていません）", // 何も選択されていない場合
+    };
+
+    let template_body = Paragraph::new(selected_body)
+        .block(Block::default().borders(Borders::ALL).title("本文"))
+        .wrap(ratatui::widgets::Wrap { trim: false }); // (追加) 自動で折り返し
+    // (ここまで追加)
 
     // --- 3. ウィジェットの描画 ---
     frame.render_widget(title, main_layout[0]);
-    frame.render_widget(templates_list, main_layout[1]); // (変更) matches_list から名前変更
+    
+    // (変更) 左ペイン (content_layout[0]) に「ステートフル」ウィジェットを描画
+    frame.render_stateful_widget(templates_list, content_layout[0], &mut app.state);
+    
+    // (変更) 右ペイン (content_layout[1]) に本文を描画
+    frame.render_widget(template_body, content_layout[1]);
 }
