@@ -4,6 +4,9 @@ use std::io::{self, BufReader, BufWriter, Stdout};
 use serde::{Deserialize, Serialize}; // serde をインポート
 use arboard::Clipboard;
 
+use unicode_width::UnicodeWidthStr;
+use textwrap::wrap;
+
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -29,21 +32,39 @@ struct App {
     templates: Vec<Template>,
     state: ListState,
     mode: Mode,
+    title_input: String,
+    body_input: String,
+    focused_input: InputFocus, 
+    editing_index: Option<usize>,
 }
 
 enum Mode {
     Viewing,        // 通常の表示・スクロールモード
     ConfirmDelete,  // 削除確認プロンプト表示モード
+    Editing,
+}
+
+enum InputFocus {
+    Title,
+    Body,
 }
 
 impl App {
-    /// 新しいAppインスタンスを作成
+
     fn new(templates: Vec<Template>) -> App {
         let mut state = ListState::default();
         if !templates.is_empty() {
-            state.select(Some(0)); // 最初の項目 (インデックス0) を選択状態にする
+            state.select(Some(0));
         }
-        App { templates, state, mode: Mode::Viewing, } // state を初期化
+        App {
+            templates,
+            state,
+            mode: Mode::Viewing,
+            title_input: String::new(),
+            body_input: String::new(),
+            focused_input: InputFocus::Title, 
+            editing_index: None,
+        }
     }
 
 
@@ -111,6 +132,73 @@ impl App {
             // (それ以外の場合は、ListState は自動的に次の要素を指す (または同じインデックスを維持) ので調整不要)
         }
         self.mode = Mode::Viewing; // 閲覧モードに戻る
+    }
+    pub fn enter_new_mode(&mut self) {
+        self.editing_index = None;
+        self.title_input = String::new();
+        self.body_input = String::new();
+        self.focused_input = InputFocus::Title;
+        self.mode = Mode::Editing;
+    }
+    pub fn enter_edit_mode(&mut self) {
+        if let Some(index) = self.state.selected() {
+            if let Some(template) = self.templates.get(index) {
+                self.editing_index = Some(index);
+                // 選択中のテンプレートの内容を TextArea にロード
+                self.title_input = template.title.clone();
+                self.body_input = template.body.clone();
+                self.focused_input = InputFocus::Title;
+                self.mode = Mode::Editing;
+            }
+        }
+    }
+    pub fn exit_editing_mode(&mut self) {
+        self.mode = Mode::Viewing;
+    }
+    pub fn save_template(&mut self) {
+        let title = self.title_input.clone();
+        let body = self.body_input.clone();
+
+        if let Some(index) = self.editing_index {
+            // 既存の編集
+            if let Some(template) = self.templates.get_mut(index) {
+                template.title = title;
+                template.body = body;
+            }
+        } else {
+            // 新規作成
+            let new_template = Template { title, body };
+            self.templates.push(new_template);
+            self.state.select(Some(self.templates.len() - 1));
+        }
+        self.mode = Mode::Viewing;
+    }
+    pub fn switch_focus(&mut self) {
+        match self.focused_input {
+            InputFocus::Title => self.focused_input = InputFocus::Body,
+            InputFocus::Body => self.focused_input = InputFocus::Title,
+        }
+    }
+    pub fn input_char(&mut self, c: char) {
+        match self.focused_input {
+            InputFocus::Title => self.title_input.push(c),
+            InputFocus::Body => self.body_input.push(c),
+        }
+    }
+    
+    /// アクティブな入力フィールドから文字を削除 (Backspace)
+    pub fn input_backspace(&mut self) {
+        match self.focused_input {
+            InputFocus::Title => { self.title_input.pop(); },
+            InputFocus::Body => { self.body_input.pop(); },
+        }
+    }
+    
+    /// 本文に改行を追加
+    pub fn input_enter(&mut self) {
+        if let InputFocus::Body = self.focused_input {
+            self.body_input.push('\n');
+        }
     }
 }
 
@@ -200,6 +288,8 @@ fn restore_terminal(
     Ok(())
 }
 
+
+
 /// TUIアプリケーションのメインループ
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -210,46 +300,74 @@ fn run_app(
     loop {
         // --- 1. UIの描画 ---
         terminal.draw(|frame| {
-            ui(frame, app); // (変更) Appの参照をui関数に渡す
+            ui(frame, app); 
         })?;
 
         // --- 2. イベントの処理 (キー入力) ---
         if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
+            let event = event::read()?;
                 // app.mode に応じてキー操作を分岐
-                match app.mode {
-                    // --- 通常モードの操作 ---
-                    Mode::Viewing => match key.code {
-                        KeyCode::Char('q') => {
-                            return Ok(());
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            app.next();
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            app.previous();
-                        }
-                        KeyCode::Char('c') => {
-                            if let Some(index) = app.state.selected() {
-                                if let Some(template) = app.templates.get(index) {
-                                    clipboard.set_text(template.body.clone())?;
+            
+            match app.mode {
+                Mode::Viewing => {
+                    if let Event::Key(key) = event {
+                        match key.code {
+                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('j') | KeyCode::Down => app.next(),
+                            KeyCode::Char('k') | KeyCode::Up => app.previous(),
+                            KeyCode::Char('c') => {
+                                if let Some(index) = app.state.selected() {
+                                    if let Some(template) = app.templates.get(index) {
+                                        clipboard.set_text(template.body.clone()).unwrap_or(());
+                                    }
                                 }
+                            },
+                            KeyCode::Char('d') => app.enter_delete_mode(),
+                            KeyCode::Char('n') => app.enter_new_mode(), // (追加)
+                            KeyCode::Char('e') => app.enter_edit_mode(), // (追加)
+                            _ => {}
+                        }
+                    }
+                },
+                Mode::ConfirmDelete => {
+                    if let Event::Key(key) = event {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => app.delete_selected(),
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.exit_delete_mode(),
+                            _ => {}
+                        }
+                    }
+                },
+                // (ここから追加)
+                Mode::Editing => {
+                    if let Event::Key(key) = event {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.exit_editing_mode();
                             }
+                            KeyCode::Tab => {
+                                app.switch_focus();
+                            }
+                            // Ctrl + s で保存
+                            KeyCode::Char('s') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                app.save_template();
+                            }
+                            // 文字入力
+                            KeyCode::Char(c) => {
+                                app.input_char(c);
+                            }
+                            // バックスペース
+                            KeyCode::Backspace => {
+                                app.input_backspace();
+                            }
+                            // Enter (本文のみ)
+                            KeyCode::Enter => {
+                                app.input_enter();
+                            }
+                            _ => {} // 矢印キーなどは無視
                         }
-                        KeyCode::Char('d') => {
-                            app.enter_delete_mode();
-                        }
-                        _ => {}
-                    },
-                    Mode::ConfirmDelete => match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            app.delete_selected();
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                            app.exit_delete_mode();
-                        }
-                        _ => {}
-                    }, 
+                    }
+
                 }
             }
         }
@@ -257,96 +375,144 @@ fn run_app(
 }
 /// UIを描画する
 /// (この関数がTUIの「見た目」を定義する)
-fn ui(frame: &mut Frame, app: &mut App) {
-    // 画面全体をレイアウト
-    let main_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .split(frame.size());
+fn ui<'a>(frame: &mut Frame, app: &mut App) {
+    match app.mode {
+        Mode::Viewing | Mode::ConfirmDelete => {
+            // --- 1. 閲覧モードのメインUI ---
+            let main_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .split(frame.area());
+            
+            let content_layout = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .split(main_layout[1]);
+            
+            // (変更) ヘルプテキストに 'n' と 'e' を追加
+            let title_text = format!(
+                "テンプレートマネージャ | {} 件 | 'j/k'移動, 'c'コピー, 'd'削除, 'n'新規, 'e'編集, 'q'終了",
+                app.templates.len()
+            );
+            let title = Paragraph::new(title_text)
+                .style(Style::default().fg(Color::White).bg(Color::Blue));
 
-    let content_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(40), // 左ペイン (タイトルリスト)
-            Constraint::Percentage(60), // 右ペイン (本文表示)
-        ])
-        .split(main_layout[1]); // main_layout[1] を分割
-    // (ここまで変更)
+            let items: Vec<ListItem> = app.templates.iter().map(|t| ListItem::new(Line::from(t.title.clone()))).collect();
+            let templates_list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title("テンプレート一覧"))
+                .highlight_style(Style::default().bg(Color::LightGreen).fg(Color::Black).add_modifier(Modifier::BOLD));
+            
+            let selected_body = match app.state.selected() {
+                Some(index) => app.templates.get(index).map_or("...", |t| t.body.as_str()),
+                None => "（テンプレートが選択されていません）",
+            };
+            let template_body = Paragraph::new(selected_body)
+                .block(Block::default().borders(Borders::ALL).title("本文"))
+                .wrap(ratatui::widgets::Wrap { trim: false });
 
-    // --- 2. ウィジェットの作成 ---
+            frame.render_widget(title, main_layout[0]);
+            frame.render_stateful_widget(templates_list, content_layout[0], &mut app.state);
+            frame.render_widget(template_body, content_layout[1]);
 
-    // 2-1. タイトルバー
-    let title_text = format!(
-        "テンプレートマネージャ | {} 件 | 'j/k'で移動, 'c'でコピー, 'q'で終了",
-        app.templates.len()
-    );
-    let title = Paragraph::new(title_text)
-        .style(Style::default().fg(Color::White).bg(Color::Blue));
-
-    // 2-2. テンプレートのタイトルリスト (左ペイン)
-    let items: Vec<ListItem> = app
-        .templates
-        .iter()
-        .map(|t| ListItem::new(Line::from(t.title.clone())))
-        .collect();
-
-    let templates_list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("テンプレート一覧"))
-        .highlight_style( // (追加) 選択ハイライトのスタイル
-            Style::default()
-                .bg(Color::LightGreen) // 背景色
-                .fg(Color::Black)      // 文字色
-                .add_modifier(Modifier::BOLD), // 太字
-        );
-
-    // (ここから追加)
-    // 2-3. 選択中のテンプレート本文 (右ペイン)
-    // 現在選択中のインデックスを取得
-    let selected_body = match app.state.selected() {
-        Some(index) => {
-            // インデックスが範囲内なら、そのテンプレートの本文
-            app.templates.get(index).map_or(
-                "（テンプレートが選択されていません）",
-                |t| t.body.as_str(), // .as_str() で &str を取得
-            )
-        }
-        None => "（テンプレートが選択されていません）", // 何も選択されていない場合
-    };
-
-    let template_body = Paragraph::new(selected_body)
-        .block(Block::default().borders(Borders::ALL).title("本文"))
-        .wrap(ratatui::widgets::Wrap { trim: false }); // (追加) 自動で折り返し
-    // (ここまで追加)
-
-    // --- 3. ウィジェットの描画 ---
-    frame.render_widget(title, main_layout[0]);
-    
-    // (変更) 左ペイン (content_layout[0]) に「ステートフル」ウィジェットを描画
-    frame.render_stateful_widget(templates_list, content_layout[0], &mut app.state);
-    
-    // (変更) 右ペイン (content_layout[1]) に本文を描画
-    frame.render_widget(template_body, content_layout[1]);
-
-    if let Mode::ConfirmDelete = app.mode {
-        if let Some(index) = app.state.selected() {
-            if let Some(template) = app.templates.get(index) {
-                // ポップアップ用のテキストを作成
-                let text = vec![
-                    Line::from(Span::styled("(y) はい / (n) いいえ", Style::default().fg(Color::Gray))),
-                ];
-                // ポップアップを描画
-                draw_popup(frame, "本当に削除しますか?", text);
+            if let Mode::ConfirmDelete = app.mode {
+                // (ここから元のポップアップロジックに戻す)
+                if let Some(index) = app.state.selected() {
+                    if let Some(template) = app.templates.get(index) {
+                        // ポップアップ用のテキストを作成
+                        let text = vec![
+                            Line::from(Span::from(format!("'{}'を本当に削除しますか？", template.title))), 
+                            Line::from(Span::from("y: はい    n: いいえ")),
+                        ];
+                        draw_popup(frame, "本当に削除しますか？(y/n)", text);
+                    }
+                }
+                // (ここまで)
             }
         }
+        // (ここから追加)
+        Mode::Editing => {
+            // --- 3. 編集モードのUI ---
+            let edit_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3), // タイトル入力 (3行)
+                    Constraint::Min(0),    // 本文入力 (残り)
+                    Constraint::Length(1), // ヘルプ
+                ])
+                .split(frame.area());
+            
+            
+            let focused_style = Style::default().fg(Color::Yellow);
+            let unfocused_style = Style::default().fg(Color::DarkGray);
+
+            let title_block = Block::default()
+                .borders(Borders::ALL)
+                .title("タイトル (編集中)")
+                .border_style(match app.focused_input {
+                    InputFocus::Title => focused_style,
+                    _ => unfocused_style,
+                });
+
+            let body_block = Block::default()
+                .borders(Borders::ALL)
+                .title("本文 (編集中)")
+                .border_style(match app.focused_input {
+                    InputFocus::Body => focused_style,
+                    _ => unfocused_style,
+                });
+
+            // --- Paragraph ウィジェットの作成 ---
+            // String を Paragraph で包む
+            let title_input_widget = Paragraph::new(app.title_input.as_str())
+                .block(title_block); // 作成した Block を設定
+
+            let body_input_widget = Paragraph::new(app.body_input.as_str())
+                .block(body_block) // 作成した Block を設定
+                .wrap(ratatui::widgets::Wrap { trim: false }); // 折り返し
+
+            let help = Paragraph::new("'Tab'でフォーカス切替, 'Ctrl+s'で保存, 'Esc'でキャンセル")
+                .style(Style::default().fg(Color::Gray));
+
+            // --- ウィジェットの描画 ---
+            // 作成した Paragraph ウィジェットを描画する
+            frame.render_widget(title_input_widget, edit_layout[0]);
+            frame.render_widget(body_input_widget, edit_layout[1]);
+            frame.render_widget(help, edit_layout[2]);
+            
+            match app.focused_input {
+                InputFocus::Title => {
+                    let display_width = UnicodeWidthStr::width(app.title_input.as_str());
+                    let cursor_x = edit_layout[0].x + 1 + display_width as u16;
+                    let cursor_y = edit_layout[0].y + 1;
+                    // (変更) 引数をタプル (x, y) で囲む
+                    frame.set_cursor_position((cursor_x, cursor_y));
+                }
+                InputFocus::Body => {
+                    let text_area_width = edit_layout[1].width.saturating_sub(2) as usize;
+                    if text_area_width == 0 { return; }
+
+                    // textwrap::wrap を使って、現在のテキストがどのように折り返されるかを取得
+                    let wrapped_lines = wrap(&app.body_input, text_area_width);
+
+                    // 現在のY座標は、折り返された後の行数
+                    let cursor_y = wrapped_lines.len().saturating_sub(1);
+
+                    // 現在のX座標は、最後の行の表示幅
+                    let cursor_x = wrapped_lines.last().map_or(0, |line| UnicodeWidthStr::width(line.as_ref()));
+
+                    frame.set_cursor_position((
+                        edit_layout[1].x + 1 + cursor_x as u16,
+                        edit_layout[1].y + 1 + cursor_y as u16,
+                    ));
+                }
+            }
+        }
+        // (ここまで追加)
     }
 }
-
 fn draw_popup(frame: &mut Frame, title: &str, text: Vec<Line>) {
     // ポップアップのサイズを定義 (ここでは固定)
-    let area = centered_rect(50, 20, frame.size());
+    let area = centered_rect(50, 20, frame.area());
 
     let popup_block = Block::default()
         .title(title)

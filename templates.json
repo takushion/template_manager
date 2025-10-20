@@ -1,10 +1,10 @@
 [
   {
-    "title": "AIプロンプト（要約）",
-    "body": "以下の文章を3行で要約してください。\n\n"
-  },
-  {
     "title": "Rust: main関数",
     "body": "fn main() {\n    println!(\"Hello, world!\");\n}"
+  },
+  {
+    "title": "sample",
+    "body": "佐藤匠真"
   }
 ]
