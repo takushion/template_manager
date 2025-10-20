@@ -1,8 +1,8 @@
 
 use std::fs::{File, OpenOptions}; // ファイル操作を強化
 use std::io::{self, BufReader, BufWriter, Stdout};
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize}; // serde をインポート
+use arboard::Clipboard;
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -11,7 +11,7 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph, List, ListItem, ListState},
+    widgets::{Block, Borders, Paragraph, List, ListItem, ListState, Clear},
 };
 
 
@@ -28,6 +28,12 @@ struct Template {
 struct App {
     templates: Vec<Template>,
     state: ListState,
+    mode: Mode,
+}
+
+enum Mode {
+    Viewing,        // 通常の表示・スクロールモード
+    ConfirmDelete,  // 削除確認プロンプト表示モード
 }
 
 impl App {
@@ -37,7 +43,7 @@ impl App {
         if !templates.is_empty() {
             state.select(Some(0)); // 最初の項目 (インデックス0) を選択状態にする
         }
-        App { templates, state } // state を初期化
+        App { templates, state, mode: Mode::Viewing, } // state を初期化
     }
 
 
@@ -74,6 +80,37 @@ impl App {
             None => 0, // 何も選択されていなければ0を選択
         };
         self.state.select(Some(i));
+    }
+
+    pub fn enter_delete_mode(&mut self) {
+        // 何も選択されていない場合は何もしない
+        if self.state.selected().is_some() {
+            self.mode = Mode::ConfirmDelete;
+        }
+    }
+
+    /// 閲覧モードに戻る
+    pub fn exit_delete_mode(&mut self) {
+        self.mode = Mode::Viewing;
+    }
+
+    /// 選択中のテンプレートを削除
+    pub fn delete_selected(&mut self) {
+        if let Some(selected_index) = self.state.selected() {
+            // 1. Vecから削除
+            self.templates.remove(selected_index);
+
+            // 2. ListState を調整
+            if self.templates.is_empty() {
+                // リストが空になった
+                self.state.select(None);
+            } else if selected_index >= self.templates.len() {
+                // 削除したのが最後の要素だった場合、新しい最後の要素を選択
+                self.state.select(Some(self.templates.len() - 1));
+            }
+            // (それ以外の場合は、ListState は自動的に次の要素を指す (または同じインデックスを維持) ので調整不要)
+        }
+        self.mode = Mode::Viewing; // 閲覧モードに戻る
     }
 }
 
@@ -168,6 +205,8 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App, // (変更) 可変参照 (&mut App) を受け取る
 ) -> Result<(), Box<dyn std::error::Error>> {
+
+    let mut clipboard = Clipboard::new()?;
     loop {
         // --- 1. UIの描画 ---
         terminal.draw(|frame| {
@@ -177,21 +216,40 @@ fn run_app(
         // --- 2. イベントの処理 (キー入力) ---
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                // (変更) キー入力処理
-                match key.code {
-                    KeyCode::Char('q') => {
-                        // 'q' キーが押されたら終了
-                        return Ok(());
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        // 'j' または 下矢印で次へ
-                        app.next();
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        // 'k' または 上矢印で前へ
-                        app.previous();
-                    }
-                    _ => {} // 他のキーは無視
+                // app.mode に応じてキー操作を分岐
+                match app.mode {
+                    // --- 通常モードの操作 ---
+                    Mode::Viewing => match key.code {
+                        KeyCode::Char('q') => {
+                            return Ok(());
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            app.next();
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            app.previous();
+                        }
+                        KeyCode::Char('c') => {
+                            if let Some(index) = app.state.selected() {
+                                if let Some(template) = app.templates.get(index) {
+                                    clipboard.set_text(template.body.clone())?;
+                                }
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            app.enter_delete_mode();
+                        }
+                        _ => {}
+                    },
+                    Mode::ConfirmDelete => match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            app.delete_selected();
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            app.exit_delete_mode();
+                        }
+                        _ => {}
+                    }, 
                 }
             }
         }
@@ -222,7 +280,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
 
     // 2-1. タイトルバー
     let title_text = format!(
-        "テンプレートマネージャ | {} 件登録 | 'j/k'で移動, 'q'で終了",
+        "テンプレートマネージャ | {} 件 | 'j/k'で移動, 'c'でコピー, 'q'で終了",
         app.templates.len()
     );
     let title = Paragraph::new(title_text)
@@ -271,4 +329,59 @@ fn ui(frame: &mut Frame, app: &mut App) {
     
     // (変更) 右ペイン (content_layout[1]) に本文を描画
     frame.render_widget(template_body, content_layout[1]);
+
+    if let Mode::ConfirmDelete = app.mode {
+        if let Some(index) = app.state.selected() {
+            if let Some(template) = app.templates.get(index) {
+                // ポップアップ用のテキストを作成
+                let text = vec![
+                    Line::from(Span::styled("(y) はい / (n) いいえ", Style::default().fg(Color::Gray))),
+                ];
+                // ポップアップを描画
+                draw_popup(frame, "本当に削除しますか?", text);
+            }
+        }
+    }
+}
+
+fn draw_popup(frame: &mut Frame, title: &str, text: Vec<Line>) {
+    // ポップアップのサイズを定義 (ここでは固定)
+    let area = centered_rect(50, 20, frame.size());
+
+    let popup_block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::DarkGray)); // ポップアップの背景色
+
+    let popup_text = Paragraph::new(text)
+        .block(popup_block)
+        .style(Style::default().fg(Color::White))
+        .alignment(Alignment::Center)
+        .wrap(ratatui::widgets::Wrap { trim: true });
+
+    // `Clear` ウィジェットで、ポップアップの描画範囲を一度クリアする
+    frame.render_widget(Clear, area); 
+    // ポップアップを描画
+    frame.render_widget(popup_text, area); 
+}
+
+/// 画面中央に指定したサイズの矩形(Rect)を計算するヘルパー関数
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1] // [1] が中央のエリア
 }
